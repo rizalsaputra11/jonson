@@ -36,27 +36,30 @@ logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler('unixnodes_bot.log'),
+        logging.FileHandler('hostforge_bot.log'),
         logging.StreamHandler()
     ]
 )
-logger = logging.getLogger('UnixNodesBot')
+logger = logging.getLogger('HostForgeBot')
 
 # Load environment variables
 load_dotenv()
 
 # Bot configuration
 TOKEN = os.getenv('DISCORD_TOKEN')
-ADMIN_IDS = {int(id_) for id_ in os.getenv('ADMIN_IDS', '1378436095783735397').split(',') if id_.strip()}
-ADMIN_ROLE_ID = int(os.getenv('ADMIN_ROLE_ID', '1378436095783735397'))
-WATERMARK = "UnixNodes VPS Service"
-WELCOME_MESSAGE = "Welcome To UnixNodes! Get Started With Us!"
+HOST_IP = os.getenv('HOST_IP')  # Optional, will fetch dynamically if not set
+ADMIN_IDS = {int(id_) for id_ in os.getenv('ADMIN_IDS', '1210291131301101618').split(',') if id_.strip()}
+ADMIN_ROLE_ID = int(os.getenv('ADMIN_ROLE_ID', '1376177459870961694'))
+WATERMARK = "HostForge VPS Service"
+WELCOME_MESSAGE = "Welcome To HostForge! Get Started With Us!"
 MAX_VPS_PER_USER = int(os.getenv('MAX_VPS_PER_USER', '3'))
 DEFAULT_OS_IMAGE = os.getenv('DEFAULT_OS_IMAGE', 'ubuntu:22.04')
 DOCKER_NETWORK = os.getenv('DOCKER_NETWORK', 'bridge')
 MAX_CONTAINERS = int(os.getenv('MAX_CONTAINERS', '100'))
-DB_FILE = 'unixnodes.db'
-BACKUP_FILE = 'unixnodes_backup.pkl'
+DB_FILE = 'hostforge.db'
+BACKUP_FILE = 'hostforge_backup.pkl'
+PORT_RANGE_START = 20000
+PORT_RANGE_END = 30000
 
 # Known miner process names/patterns
 MINER_PATTERNS = [
@@ -80,12 +83,7 @@ RUN apt-get update && \\
     apt-get clean && rm -rf /var/lib/apt/lists/*
 
 # Root password
-RUN echo "root:{root_password}" | chpasswd
-
-# Create user and set password
-RUN useradd -m -s /bin/bash {username} && \\
-    echo "{username}:{user_password}" | chpasswd && \\
-    usermod -aG sudo {username}
+RUN echo "root:root" | chpasswd
 
 # Enable SSH login
 RUN mkdir /var/run/sshd && \\
@@ -96,11 +94,11 @@ RUN mkdir /var/run/sshd && \\
 RUN systemctl enable ssh && \\
     systemctl enable docker
 
-# UnixNodes customization
+# HostForge customization
 RUN echo '{welcome_message}' > /etc/motd && \\
-    echo 'echo "{welcome_message}"' >> /home/{username}/.bashrc && \\
+    echo 'echo "{welcome_message}"' >> /root/.bashrc && \\
     echo '{watermark}' > /etc/machine-info && \\
-    echo 'unixnodes-{vps_id}' > /etc/hostname
+    echo 'hostforge-{vps_id}' > /etc/hostname
 
 # Install additional useful packages
 RUN apt-get update && \\
@@ -144,7 +142,8 @@ class Database:
                 restart_count INTEGER DEFAULT 0,
                 last_restart TEXT,
                 status TEXT DEFAULT 'running',
-                use_custom_image BOOLEAN DEFAULT 1
+                use_custom_image BOOLEAN DEFAULT 1,
+                external_ssh_port INTEGER
             )
         ''')
         
@@ -292,6 +291,10 @@ class Database:
         self.cursor.execute('SELECT user_id FROM admin_users')
         return [row[0] for row in self.cursor.fetchall()]
 
+    def get_used_ports(self):
+        self.cursor.execute('SELECT external_ssh_port FROM vps_instances WHERE external_ssh_port IS NOT NULL')
+        return {row[0] for row in self.cursor.fetchall()}
+
     def backup_data(self):
         """Backup all data to a file"""
         data = {
@@ -366,12 +369,13 @@ class Database:
         self.conn.close()
 
 # Initialize bot with command prefix '/'
-class UnixNodesBot(commands.Bot):
+class HostForgeBot(commands.Bot):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.db = Database(DB_FILE)
         self.session = None
         self.docker_client = None
+        self.public_ip = None
         self.system_stats = {
             'cpu_usage': 0,
             'memory_usage': 0,
@@ -386,6 +390,8 @@ class UnixNodesBot(commands.Bot):
         try:
             self.docker_client = docker.from_env()
             logger.info("Docker client initialized successfully")
+            self.public_ip = HOST_IP or await self.get_public_ip()
+            logger.info(f"Public IP: {self.public_ip}")
             self.loop.create_task(self.update_system_stats())
             self.loop.create_task(self.anti_miner_monitor())
             # Reconnect to existing containers
@@ -395,6 +401,18 @@ class UnixNodesBot(commands.Bot):
         except Exception as e:
             logger.error(f"Failed to initialize Docker client: {e}")
             self.docker_client = None
+
+    async def get_public_ip(self):
+        try:
+            async with self.session.get('https://api.ipify.org') as resp:
+                if resp.status == 200:
+                    return await resp.text()
+                else:
+                    logger.error(f"Failed to get public IP: {resp.status}")
+                    return '127.0.0.1'  # Fallback
+        except Exception as e:
+            logger.error(f"Error getting public IP: {e}")
+            return '127.0.0.1'
 
     async def reconnect_containers(self):
         """Reconnect to existing containers on startup"""
@@ -503,24 +521,13 @@ def generate_vps_id():
     """Generate a unique VPS ID"""
     return ''.join(random.choices(string.ascii_uppercase + string.digits, k=10))
 
-def generate_ssh_password():
-    """Generate a random SSH password"""
-    chars = string.ascii_letters + string.digits + "!@#$%^&*"
-    return ''.join(random.choices(chars, k=16))
-
-def has_admin_role(ctx):
-    """Check if user has admin role or is in ADMIN_IDS"""
-    if isinstance(ctx, discord.Interaction):
-        user_id = ctx.user.id
-        roles = ctx.user.roles
-    else:
-        user_id = ctx.author.id
-        roles = ctx.author.roles
-    
-    if user_id in ADMIN_IDS:
-        return True
-    
-    return any(role.id == ADMIN_ROLE_ID for role in roles)
+def get_available_port(db):
+    """Get an available random port for SSH forwarding"""
+    used_ports = db.get_used_ports()
+    while True:
+        port = random.randint(PORT_RANGE_START, PORT_RANGE_END)
+        if port not in used_ports:
+            return port
 
 async def capture_ssh_session_line(process):
     """Capture the SSH session line from tmate output"""
@@ -597,7 +604,7 @@ async def wait_for_apt_lock(container_id, status_msg):
     
     return False
 
-async def build_custom_image(vps_id, username, root_password, user_password, base_image=DEFAULT_OS_IMAGE):
+async def build_custom_image(vps_id, base_image=DEFAULT_OS_IMAGE):
     """Build a custom Docker image using our template"""
     try:
         # Create a temporary directory for the Dockerfile
@@ -607,9 +614,6 @@ async def build_custom_image(vps_id, username, root_password, user_password, bas
         # Generate Dockerfile content
         dockerfile_content = DOCKERFILE_TEMPLATE.format(
             base_image=base_image,
-            root_password=root_password,
-            username=username,
-            user_password=user_password,
             welcome_message=WELCOME_MESSAGE,
             watermark=WATERMARK,
             vps_id=vps_id
@@ -621,7 +625,7 @@ async def build_custom_image(vps_id, username, root_password, user_password, bas
             f.write(dockerfile_content)
         
         # Build the image
-        image_tag = f"unixnodes/{vps_id.lower()}:latest"
+        image_tag = f"hostforge/{vps_id.lower()}:latest"
         build_process = await asyncio.create_subprocess_exec(
             "docker", "build", "-t", image_tag, temp_dir,
             stdout=asyncio.subprocess.PIPE,
@@ -645,8 +649,8 @@ async def build_custom_image(vps_id, username, root_password, user_password, bas
         except Exception as e:
             logger.error(f"Error cleaning up temp directory: {e}")
 
-async def setup_container(container_id, status_msg, memory, username, vps_id=None, use_custom_image=False):
-    """Enhanced container setup with UnixNodes customization"""
+async def setup_container(container_id, status_msg, memory, vps_id=None, use_custom_image=False):
+    """Enhanced container setup with HostForge customization"""
     try:
         # Ensure container is running
         if isinstance(status_msg, discord.Interaction):
@@ -663,10 +667,7 @@ async def setup_container(container_id, status_msg, memory, username, vps_id=Non
             container.start()
             await asyncio.sleep(5)
 
-        # Generate SSH password
-        ssh_password = generate_ssh_password()
-        
-        # Install tmate and other required packages
+        # Install tmate and other required packages if not custom
         if not use_custom_image:
             if isinstance(status_msg, discord.Interaction):
                 await status_msg.followup.send("📦 Installing required packages...", ephemeral=True)
@@ -693,30 +694,28 @@ async def setup_container(container_id, status_msg, memory, username, vps_id=Non
         else:
             await status_msg.edit(content="🔐 Configuring SSH access...")
             
-        # Create user and set password (if not using custom image)
+        # For non-custom image, setup root
         if not use_custom_image:
-            user_setup_commands = [
-                f"useradd -m -s /bin/bash {username}",
-                f"echo '{username}:{ssh_password}' | chpasswd",
-                f"usermod -aG sudo {username}",
-                "sed -i 's/#PermitRootLogin prohibit-password/PermitRootLogin no/' /etc/ssh/sshd_config",
+            setup_commands = [
+                'echo "root:root" | chpasswd',
+                "sed -i 's/#PermitRootLogin prohibit-password/PermitRootLogin yes/' /etc/ssh/sshd_config",
                 "sed -i 's/#PasswordAuthentication yes/PasswordAuthentication yes/' /etc/ssh/sshd_config",
                 "service ssh restart"
             ]
             
-            for cmd in user_setup_commands:
+            for cmd in setup_commands:
                 success, output = await run_docker_command(container_id, ["bash", "-c", cmd])
                 if not success:
-                    raise Exception(f"Failed to setup user: {output}")
+                    raise Exception(f"Failed to setup SSH: {output}")
 
-        # Set UnixNodes customization
+        # Set HostForge customization
         if isinstance(status_msg, discord.Interaction):
-            await status_msg.followup.send("🎨 Setting up UnixNodes customization...", ephemeral=True)
+            await status_msg.followup.send("🎨 Setting up HostForge customization...", ephemeral=True)
         else:
-            await status_msg.edit(content="🎨 Setting up UnixNodes customization...")
+            await status_msg.edit(content="🎨 Setting up HostForge customization...")
             
         # Create welcome message file
-        welcome_cmd = f"echo '{WELCOME_MESSAGE}' > /etc/motd && echo 'echo \"{WELCOME_MESSAGE}\"' >> /home/{username}/.bashrc"
+        welcome_cmd = f"echo '{WELCOME_MESSAGE}' > /etc/motd && echo 'echo \"{WELCOME_MESSAGE}\"' >> /root/.bashrc"
         success, output = await run_docker_command(container_id, ["bash", "-c", welcome_cmd])
         if not success:
             logger.warning(f"Could not set welcome message: {output}")
@@ -724,7 +723,7 @@ async def setup_container(container_id, status_msg, memory, username, vps_id=Non
         # Set hostname and watermark
         if not vps_id:
             vps_id = generate_vps_id()
-        hostname_cmd = f"echo 'unixnodes-{vps_id}' > /etc/hostname && hostname unixnodes-{vps_id}"
+        hostname_cmd = f"echo 'hostforge-{vps_id}' > /etc/hostname && hostname hostforge-{vps_id}"
         success, output = await run_docker_command(container_id, ["bash", "-c", hostname_cmd])
         if not success:
             raise Exception(f"Failed to set hostname: {output}")
@@ -750,9 +749,7 @@ async def setup_container(container_id, status_msg, memory, username, vps_id=Non
             "ufw allow ssh",
             "ufw --force enable",
             "apt-get -y autoremove",
-            "apt-get clean",
-            f"chown -R {username}:{username} /home/{username}",
-            f"chmod 700 /home/{username}"
+            "apt-get clean"
         ]
         
         for cmd in security_commands:
@@ -761,11 +758,11 @@ async def setup_container(container_id, status_msg, memory, username, vps_id=Non
                 logger.warning(f"Security setup command failed: {cmd} - {output}")
 
         if isinstance(status_msg, discord.Interaction):
-            await status_msg.followup.send("✅ UnixNodes VPS setup completed successfully!", ephemeral=True)
+            await status_msg.followup.send("✅ HostForge VPS setup completed successfully!", ephemeral=True)
         else:
-            await status_msg.edit(content="✅ UnixNodes VPS setup completed successfully!")
+            await status_msg.edit(content="✅ HostForge VPS setup completed successfully!")
             
-        return True, ssh_password, vps_id
+        return True, vps_id
     except Exception as e:
         error_msg = f"Setup failed: {str(e)}"
         logger.error(error_msg)
@@ -773,12 +770,12 @@ async def setup_container(container_id, status_msg, memory, username, vps_id=Non
             await status_msg.followup.send(f"❌ {error_msg}", ephemeral=True)
         else:
             await status_msg.edit(content=f"❌ {error_msg}")
-        return False, None, None
+        return False, None
 
 intents = discord.Intents.default()
 intents.message_content = True
 intents.members = True
-bot = UnixNodesBot(command_prefix='/', intents=intents, help_command=None)
+bot = HostForgeBot(command_prefix='/', intents=intents, help_command=None)
 
 @bot.event
 async def on_ready():
@@ -799,7 +796,7 @@ async def on_ready():
                     logger.error(f"Error starting container: {e}")
     
     try:
-        await bot.change_presence(activity=discord.Activity(type=discord.ActivityType.watching, name="UnixNodes VPS"))
+        await bot.change_presence(activity=discord.Activity(type=discord.ActivityType.watching, name="HostForge VPS"))
         synced_commands = await bot.tree.sync()
         logger.info(f"Synced {len(synced_commands)} slash commands")
     except Exception as e:
@@ -809,7 +806,7 @@ async def on_ready():
 async def show_commands(ctx):
     """Show all available commands"""
     try:
-        embed = discord.Embed(title="🤖 UnixNodes VPS Bot Commands", color=discord.Color.blue())
+        embed = discord.Embed(title="🤖 HostForge VPS Bot Commands", color=discord.Color.blue())
         
         # User commands
         embed.add_field(name="User Commands", value="""
@@ -824,11 +821,12 @@ async def show_commands(ctx):
 `/vps_shell <vps_id>` - Get shell access to your VPS
 `/vps_console <vps_id>` - Get direct console access to your VPS
 `/vps_usage` - Show your VPS usage statistics
+`/run_command <vps_id> <command>` - Run a command in your VPS
 """, inline=False)
         
         # Admin commands
         if has_admin_role(ctx):
-            embed.add_field(name="Admin Commards", value="""
+            embed.add_field(name="Admin Commands", value="""
 `/vps_list` - List all VPS instances
 `/delete_vps <vps_id>` - Delete a VPS
 `/admin_stats` - Show system statistics
@@ -857,6 +855,20 @@ async def show_commands(ctx):
     except Exception as e:
         logger.error(f"Error in show_commands: {e}")
         await ctx.send("❌ An error occurred while processing your request.")
+
+def has_admin_role(ctx):
+    """Check if user has admin role or is in ADMIN_IDS"""
+    if isinstance(ctx, discord.Interaction):
+        user_id = ctx.user.id
+        roles = ctx.user.roles
+    else:
+        user_id = ctx.author.id
+        roles = ctx.author.roles
+    
+    if user_id in ADMIN_IDS:
+        return True
+    
+    return any(role.id == ADMIN_ROLE_ID for role in roles)
 
 @bot.hybrid_command(name='add_admin', description='Add a new admin (Admin only)')
 @app_commands.describe(
@@ -923,7 +935,7 @@ async def list_admins(ctx):
     disk="Disk space in GB",
     owner="User who will own the VPS",
     os_image="OS image to use",
-    use_custom_image="Use custom UnixNodes image (recommended)"
+    use_custom_image="Use custom HostForge image (recommended)"
 )
 async def create_vps_command(ctx, memory: int, cpu: int, disk: int, owner: discord.Member, 
                            os_image: str = DEFAULT_OS_IMAGE, use_custom_image: bool = True):
@@ -946,13 +958,13 @@ async def create_vps_command(ctx, memory: int, cpu: int, disk: int, owner: disco
 
     try:
         # Validate inputs
-        if memory < 1 or memory > 5120000:
+        if memory < 1 or memory > 512:
             await ctx.send("❌ Memory must be between 1GB and 512GB", ephemeral=True)
             return
-        if cpu < 1 or cpu > 320000:
+        if cpu < 1 or cpu > 32:
             await ctx.send("❌ CPU cores must be between 1 and 32", ephemeral=True)
             return
-        if disk < 10 or disk > 10000000:
+        if disk < 10 or disk > 1000:
             await ctx.send("❌ Disk space must be between 10GB and 1000GB", ephemeral=True)
             return
 
@@ -967,19 +979,19 @@ async def create_vps_command(ctx, memory: int, cpu: int, disk: int, owner: disco
             await ctx.send(f"❌ {owner.mention} already has the maximum number of VPS instances ({bot.db.get_setting('max_vps_per_user')})", ephemeral=True)
             return
 
-        status_msg = await ctx.send("🚀 Creating UnixNodes VPS instance... This may take a few minutes.")
+        status_msg = await ctx.send("🚀 Creating HostForge VPS instance... This may take a few minutes.")
 
         memory_bytes = memory * 1024 * 1024 * 1024
         vps_id = generate_vps_id()
-        username = owner.name.lower().replace(" ", "_")[:20]
-        root_password = generate_ssh_password()
-        user_password = generate_ssh_password()
+        username = "root"
+        password = "root"
         token = generate_token()
+        external_port = get_available_port(bot.db)
 
         if use_custom_image:
             await status_msg.edit(content="🔨 Building custom Docker image...")
             try:
-                image_tag = await build_custom_image(vps_id, username, root_password, user_password, os_image)
+                image_tag = await build_custom_image(vps_id, os_image)
             except Exception as e:
                 await status_msg.edit(content=f"❌ Failed to build Docker image: {str(e)}")
                 return
@@ -990,14 +1002,15 @@ async def create_vps_command(ctx, memory: int, cpu: int, disk: int, owner: disco
                     image_tag,
                     detach=True,
                     privileged=True,
-                    hostname=f"unixnodes-{vps_id}",
+                    hostname=f"hostforge-{vps_id}",
                     mem_limit=memory_bytes,
                     cpu_period=100000,
                     cpu_quota=int(cpu * 100000),
                     cap_add=["ALL"],
                     network=DOCKER_NETWORK,
+                    ports={'22/tcp': str(external_port)},
                     volumes={
-                        f'unixnodes-{vps_id}': {'bind': '/data', 'mode': 'rw'}
+                        f'hostforge-{vps_id}': {'bind': '/data', 'mode': 'rw'}
                     },
                     restart_policy={"Name": "always"}
                 )
@@ -1011,7 +1024,7 @@ async def create_vps_command(ctx, memory: int, cpu: int, disk: int, owner: disco
                     os_image,
                     detach=True,
                     privileged=True,
-                    hostname=f"unixnodes-{vps_id}",
+                    hostname=f"hostforge-{vps_id}",
                     mem_limit=memory_bytes,
                     cpu_period=100000,
                     cpu_quota=int(cpu * 100000),
@@ -1019,8 +1032,9 @@ async def create_vps_command(ctx, memory: int, cpu: int, disk: int, owner: disco
                     command="tail -f /dev/null",
                     tty=True,
                     network=DOCKER_NETWORK,
+                    ports={'22/tcp': str(external_port)},
                     volumes={
-                        f'unixnodes-{vps_id}': {'bind': '/data', 'mode': 'rw'}
+                        f'hostforge-{vps_id}': {'bind': '/data', 'mode': 'rw'}
                     },
                     restart_policy={"Name": "always"}
                 )
@@ -1030,7 +1044,7 @@ async def create_vps_command(ctx, memory: int, cpu: int, disk: int, owner: disco
                     DEFAULT_OS_IMAGE,
                     detach=True,
                     privileged=True,
-                    hostname=f"unixnodes-{vps_id}",
+                    hostname=f"hostforge-{vps_id}",
                     mem_limit=memory_bytes,
                     cpu_period=100000,
                     cpu_quota=int(cpu * 100000),
@@ -1038,22 +1052,22 @@ async def create_vps_command(ctx, memory: int, cpu: int, disk: int, owner: disco
                     command="tail -f /dev/null",
                     tty=True,
                     network=DOCKER_NETWORK,
+                    ports={'22/tcp': str(external_port)},
                     volumes={
-                        f'unixnodes-{vps_id}': {'bind': '/data', 'mode': 'rw'}
+                        f'hostforge-{vps_id}': {'bind': '/data', 'mode': 'rw'}
                     },
                     restart_policy={"Name": "always"}
                 )
                 os_image = DEFAULT_OS_IMAGE
 
-        await status_msg.edit(content="🔧 Container created. Setting up UnixNodes environment...")
+        await status_msg.edit(content="🔧 Container created. Setting up HostForge environment...")
         await asyncio.sleep(5)
 
-        setup_success, ssh_password, _ = await setup_container(
+        setup_success, _ = await setup_container(
             container.id, 
             status_msg, 
             memory, 
-            username, 
-            vps_id,
+            vps_id=vps_id,
             use_custom_image=use_custom_image
         )
         if not setup_success:
@@ -1079,8 +1093,8 @@ async def create_vps_command(ctx, memory: int, cpu: int, disk: int, owner: disco
             "cpu": cpu,
             "disk": disk,
             "username": username,
-            "password": ssh_password,
-            "root_password": root_password if use_custom_image else None,
+            "password": password,
+            "root_password": "root",
             "created_by": str(owner.id),
             "created_at": str(datetime.datetime.now()),
             "tmate_session": ssh_session_line,
@@ -1089,27 +1103,26 @@ async def create_vps_command(ctx, memory: int, cpu: int, disk: int, owner: disco
             "restart_count": 0,
             "last_restart": None,
             "status": "running",
-            "use_custom_image": use_custom_image
+            "use_custom_image": use_custom_image,
+            "external_ssh_port": external_port
         }
         
         bot.db.add_vps(vps_data)
         
         try:
-            embed = discord.Embed(title="🎉 UnixNodes VPS Creation Successful", color=discord.Color.green())
+            embed = discord.Embed(title="🎉 HostForge VPS Creation Successful", color=discord.Color.green())
             embed.add_field(name="🆔 VPS ID", value=vps_id, inline=True)
             embed.add_field(name="💾 Memory", value=f"{memory}GB", inline=True)
             embed.add_field(name="⚡ CPU", value=f"{cpu} cores", inline=True)
             embed.add_field(name="💿 Disk", value=f"{disk}GB", inline=True)
             embed.add_field(name="👤 Username", value=username, inline=True)
-            embed.add_field(name="🔑 User Password", value=f"||{ssh_password}||", inline=False)
-            if use_custom_image:
-                embed.add_field(name="🔑 Root Password", value=f"||{root_password}||", inline=False)
+            embed.add_field(name="🔑 Password", value=f"||{password}||", inline=False)
             embed.add_field(name="🔒 Tmate Session", value=f"```{ssh_session_line}```", inline=False)
-            embed.add_field(name="🔌 Direct SSH", value=f"```ssh {username}@<server-ip>```", inline=False)
-            embed.add_field(name="ℹ️ Note", value="This is a UnixNodes VPS instance. You can install and configure additional packages as needed.", inline=False)
+            embed.add_field(name="🔌 Direct SSH", value=f"```ssh root@{bot.public_ip} -p {external_port}```", inline=False)
+            embed.add_field(name="ℹ️ Note", value="This is a HostForge VPS instance. You can install and configure additional packages as needed.", inline=False)
             
             await owner.send(embed=embed)
-            await status_msg.edit(content=f"✅ UnixNodes VPS creation successful! VPS has been created for {owner.mention}. Check your DMs for connection details.")
+            await status_msg.edit(content=f"✅ HostForge VPS creation successful! VPS has been created for {owner.mention}. Check your DMs for connection details.")
         except discord.Forbidden:
             await status_msg.edit(content=f"❌ I couldn't send a DM to {owner.mention}. Please ask them to enable DMs from server members.")
             
@@ -1134,7 +1147,7 @@ async def list_vps(ctx):
             await ctx.send("You don't have any VPS instances.", ephemeral=True)
             return
 
-        embed = discord.Embed(title="Your UnixNodes VPS Instances", color=discord.Color.blue())
+        embed = discord.Embed(title="Your HostForge VPS Instances", color=discord.Color.blue())
         
         for vps in user_vps:
             try:
@@ -1157,6 +1170,7 @@ Username: {vps.get('username', 'Unknown')}
 OS: {vps.get('os_image', DEFAULT_OS_IMAGE)}
 Created: {vps.get('created_at', 'Unknown')}
 Restarts: {vps.get('restart_count', 0)}
+SSH Port: {vps.get('external_ssh_port', 'Not set')}
 """,
                 inline=False
             )
@@ -1179,7 +1193,7 @@ async def admin_list_vps(ctx):
             await ctx.send("No VPS instances found.", ephemeral=True)
             return
 
-        embed = discord.Embed(title="All UnixNodes VPS Instances", color=discord.Color.blue())
+        embed = discord.Embed(title="All HostForge VPS Instances", color=discord.Color.blue())
         valid_vps_count = 0
         
         for token, vps in all_vps.items():
@@ -1212,6 +1226,7 @@ Username: {vps.get('username', 'Unknown')}
 OS: {vps.get('os_image', DEFAULT_OS_IMAGE)}
 Created: {vps.get('created_at', 'Unknown')}
 Restarts: {vps.get('restart_count', 0)}
+SSH Port: {vps.get('external_ssh_port', 'Not set')}
 """
 
             embed.add_field(
@@ -1257,7 +1272,7 @@ async def delete_vps(ctx, vps_id: str):
         
         bot.db.remove_vps(token)
         
-        await ctx.send(f"✅ UnixNodes VPS {vps_id} has been deleted successfully!")
+        await ctx.send(f"✅ HostForge VPS {vps_id} has been deleted successfully!")
     except Exception as e:
         logger.error(f"Error in delete_vps: {e}")
         await ctx.send(f"❌ Error deleting VPS: {str(e)}")
@@ -1299,22 +1314,22 @@ async def connect_vps(ctx, token: str):
 
         bot.db.update_vps(token, {"tmate_session": ssh_session_line})
         
-        embed = discord.Embed(title="UnixNodes VPS Connection Details", color=discord.Color.blue())
+        embed = discord.Embed(title="HostForge VPS Connection Details", color=discord.Color.blue())
         embed.add_field(name="Username", value=vps["username"], inline=True)
         embed.add_field(name="SSH Password", value=f"||{vps.get('password', 'Not set')}||", inline=True)
         embed.add_field(name="Tmate Session", value=f"```{ssh_session_line}```", inline=False)
+        embed.add_field(name="Direct SSH", value=f"```ssh root@{bot.public_ip} -p {vps['external_ssh_port']}```", inline=False)
         embed.add_field(name="Connection Instructions", value="""
 1. Copy the Tmate session command
 2. Open your terminal
 3. Paste and run the command
-4. You will be connected to your UnixNodes VPS
+4. You will be connected to your HostForge VPS
 
-Or use direct SSH:
-```ssh {username}@<server-ip>```
-""".format(username=vps["username"]), inline=False)
+Or use direct SSH with the provided command.
+""", inline=False)
         
         await ctx.author.send(embed=embed)
-        await ctx.send("✅ Connection details sent to your DMs! Use the Tmate command to connect to your UnixNodes VPS.", ephemeral=True)
+        await ctx.send("✅ Connection details sent to your DMs! Use the Tmate command to connect to your HostForge VPS.", ephemeral=True)
         
     except discord.Forbidden:
         await ctx.send("❌ I couldn't send you a DM. Please enable DMs from server members.", ephemeral=True)
@@ -1377,6 +1392,7 @@ async def vps_stats(ctx, vps_id: str):
 Memory: {vps['memory']}GB
 CPU: {vps['cpu']} cores
 Disk Allocated: {vps['disk']}GB
+SSH Port: {vps['external_ssh_port']}
 """, inline=True)
             
             await ctx.send(embed=embed)
@@ -1407,7 +1423,7 @@ async def change_ssh_password(ctx, vps_id: str):
             new_password = generate_ssh_password()
             
             process = await asyncio.create_subprocess_exec(
-                "docker", "exec", vps["container_id"], "bash", "-c", f"echo '{vps['username']}:{new_password}' | chpasswd",
+                "docker", "exec", vps["container_id"], "bash", "-c", f"echo 'root:{new_password}' | chpasswd",
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE
             )
@@ -1419,8 +1435,9 @@ async def change_ssh_password(ctx, vps_id: str):
             bot.db.update_vps(token, {'password': new_password})
             
             embed = discord.Embed(title=f"SSH Password Updated for VPS {vps_id}", color=discord.Color.green())
-            embed.add_field(name="Username", value=vps['username'], inline=True)
+            embed.add_field(name="Username", value="root", inline=True)
             embed.add_field(name="New Password", value=f"||{new_password}||", inline=False)
+            embed.add_field(name="Direct SSH", value=f"```ssh root@{bot.public_ip} -p {vps['external_ssh_port']}```", inline=False)
             
             await ctx.author.send(embed=embed)
             await ctx.send("✅ SSH password updated successfully! Check your DMs for the new password.", ephemeral=True)
@@ -1444,7 +1461,7 @@ async def admin_stats(ctx):
         # Get system stats
         stats = bot.system_stats
         
-        embed = discord.Embed(title="UnixNodes System Statistics", color=discord.Color.blue())
+        embed = discord.Embed(title="HostForge System Statistics", color=discord.Color.blue())
         embed.add_field(name="VPS Instances", value=f"Total: {len(bot.db.get_all_vps())}\nRunning: {len([c for c in containers if c.status == 'running'])}", inline=True)
         embed.add_field(name="Docker Containers", value=f"Total: {len(containers)}\nRunning: {len([c for c in containers if c.status == 'running'])}", inline=True)
         embed.add_field(name="CPU Usage", value=f"{stats['cpu_usage']}%", inline=True)
@@ -1600,7 +1617,7 @@ async def vps_shell(ctx, vps_id: str):
 
             await ctx.send(f"✅ Shell access to VPS {vps_id}:\n"
                           f"```docker exec -it {vps['container_id']} bash```\n"
-                          f"Username: {vps['username']}\n"
+                          f"Username: root\n"
                           f"Password: ||{vps.get('password', 'Not set')}||", ephemeral=True)
         except Exception as e:
             await ctx.send(f"❌ Error accessing VPS shell: {str(e)}", ephemeral=True)
@@ -1636,6 +1653,36 @@ async def vps_console(ctx, vps_id: str):
         logger.error(f"Error in vps_console: {e}")
         await ctx.send(f"❌ Error: {str(e)}", ephemeral=True)
 
+@bot.hybrid_command(name='run_command', description='Run a command in your VPS')
+@app_commands.describe(
+    vps_id="ID of the VPS",
+    command="Command to run"
+)
+async def run_command(ctx, vps_id: str, command: str):
+    """Run a command in your VPS"""
+    try:
+        token, vps = bot.db.get_vps_by_id(vps_id)
+        if not vps or (vps["created_by"] != str(ctx.author.id) and not has_admin_role(ctx)):
+            await ctx.send("❌ VPS not found or you don't have access to it!", ephemeral=True)
+            return
+
+        try:
+            container = bot.docker_client.containers.get(vps["container_id"])
+            if container.status != "running":
+                await ctx.send("❌ VPS is not running!", ephemeral=True)
+                return
+
+            success, output = await run_docker_command(vps["container_id"], ["bash", "-c", command])
+            if success:
+                await ctx.send(f"✅ Command executed successfully:\n```{output}```", ephemeral=True)
+            else:
+                await ctx.send(f"❌ Command failed:\n```{output}```", ephemeral=True)
+        except Exception as e:
+            await ctx.send(f"❌ Error running command: {str(e)}", ephemeral=True)
+    except Exception as e:
+        logger.error(f"Error in run_command: {e}")
+        await ctx.send(f"❌ Error: {str(e)}", ephemeral=True)
+
 @bot.hybrid_command(name='vps_usage', description='Show your VPS usage statistics')
 async def vps_usage(ctx):
     """Show your VPS usage statistics"""
@@ -1647,7 +1694,7 @@ async def vps_usage(ctx):
         total_disk = sum(vps['disk'] for vps in user_vps)
         total_restarts = sum(vps.get('restart_count', 0) for vps in user_vps)
         
-        embed = discord.Embed(title="Your UnixNodes VPS Usage", color=discord.Color.blue())
+        embed = discord.Embed(title="Your HostForge VPS Usage", color=discord.Color.blue())
         embed.add_field(name="Total VPS Instances", value=len(user_vps), inline=True)
         embed.add_field(name="Total Memory Allocated", value=f"{total_memory}GB", inline=True)
         embed.add_field(name="Total CPU Cores Allocated", value=total_cpu, inline=True)
@@ -1673,7 +1720,7 @@ async def global_stats(ctx):
         total_disk = sum(vps['disk'] for vps in all_vps.values())
         total_restarts = sum(vps.get('restart_count', 0) for vps in all_vps.values())
         
-        embed = discord.Emembed(title="UnixNodes Global Usage Statistics", color=discord.Color.blue())
+        embed = discord.Embed(title="HostForge Global Usage Statistics", color=discord.Color.blue())
         embed.add_field(name="Total VPS Created", value=bot.db.get_stat('total_vps_created'), inline=True)
         embed.add_field(name="Total Restarts", value=bot.db.get_stat('total_restarts'), inline=True)
         embed.add_field(name="Current VPS Instances", value=len(all_vps), inline=True)
@@ -1794,14 +1841,14 @@ async def emergency_remove(ctx, vps_id: str):
             return
 
         try:
-            # First try to stop the container normally
+            # First try to stop the container
             try:
                 container = bot.docker_client.containers.get(vps["container_id"])
                 container.stop()
             except:
                 pass
             
-            # Then try to remove it forcefully
+            # Then remove it forcefully
             try:
                 subprocess.run(["docker", "rm", "-f", vps["container_id"]], check=True)
             except subprocess.CalledProcessError as e:
@@ -1952,7 +1999,7 @@ async def edit_vps(ctx, vps_id: str, memory: Optional[int] = None, cpu: Optional
                 vps['os_image'],
                 detach=True,
                 privileged=True,
-                hostname=f"unixnodes-{vps_id}",
+                hostname=f"hostforge-{vps_id}",
                 mem_limit=memory_bytes,
                 cpu_period=100000,
                 cpu_quota=cpu_quota,
@@ -1960,19 +2007,19 @@ async def edit_vps(ctx, vps_id: str, memory: Optional[int] = None, cpu: Optional
                 command="tail -f /dev/null",
                 tty=True,
                 network=DOCKER_NETWORK,
+                ports={'22/tcp': str(vps['external_ssh_port'])},
                 volumes={
-                    f'unixnodes-{vps_id}': {'bind': '/data', 'mode': 'rw'}
+                    f'hostforge-{vps_id}': {'bind': '/data', 'mode': 'rw'}
                 },
                 restart_policy={"Name": "always"}
             )
 
             updates['container_id'] = new_container.id
             await asyncio.sleep(5)
-            setup_success, _, _ = await setup_container(
+            setup_success, _ = await setup_container(
                 new_container.id, 
                 ctx, 
                 memory or vps['memory'], 
-                vps['username'], 
                 vps_id=vps_id,
                 use_custom_image=vps['use_custom_image']
             )
@@ -2078,7 +2125,7 @@ async def reinstall_bot(ctx):
         return
 
     try:
-        await ctx.send("🔄 Reinstalling UnixNodes bot... This may take a few minutes.")
+        await ctx.send("🔄 Reinstalling HostForge bot... This may take a few minutes.")
         
         # Create Dockerfile for bot reinstallation
         dockerfile_content = f"""
@@ -2107,7 +2154,7 @@ CMD ["python", "bot.py"]
         
         # Build and run the bot in a container
         process = await asyncio.create_subprocess_exec(
-            "docker", "build", "-t", "unixnodes-bot", "-f", "Dockerfile.bot", ".",
+            "docker", "build", "-t", "hostforge-bot", "-f", "Dockerfile.bot", ".",
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE
         )
@@ -2138,7 +2185,7 @@ class VPSManagementView(ui.View):
         if token:
             bot.db.remove_vps(token)
         
-        embed = discord.Embed(title=f"UnixNodes VPS Management - {self.vps_id}", color=discord.Color.red())
+        embed = discord.Embed(title=f"HostForge VPS Management - {self.vps_id}", color=discord.Color.red())
         embed.add_field(name="Status", value="🔴 Container Not Found", inline=True)
         embed.add_field(name="Note", value="This VPS instance is no longer available. Please create a new one.", inline=False)
         
@@ -2174,7 +2221,7 @@ class VPSManagementView(ui.View):
             if token:
                 bot.db.update_vps(token, {'status': 'running'})
             
-            embed = discord.Embed(title=f"UnixNodes VPS Management - {self.vps_id}", color=discord.Color.green())
+            embed = discord.Embed(title=f"HostForge VPS Management - {self.vps_id}", color=discord.Color.green())
             embed.add_field(name="Status", value="🟢 Running", inline=True)
             
             if vps:
@@ -2185,7 +2232,7 @@ class VPSManagementView(ui.View):
                 embed.add_field(name="Created", value=vps['created_at'], inline=True)
             
             await interaction.message.edit(embed=embed)
-            await interaction.followup.send("✅ UnixNodes VPS started successfully!", ephemeral=True)
+            await interaction.followup.send("✅ HostForge VPS started successfully!", ephemeral=True)
         except Exception as e:
             await interaction.followup.send(f"❌ Error starting VPS: {str(e)}", ephemeral=True)
 
@@ -2210,7 +2257,7 @@ class VPSManagementView(ui.View):
             if token:
                 bot.db.update_vps(token, {'status': 'stopped'})
             
-            embed = discord.Emembed(title=f"UnixNodes VPS Management - {self.vps_id}", color=discord.Color.orange())
+            embed = discord.Embed(title=f"HostForge VPS Management - {self.vps_id}", color=discord.Color.orange())
             embed.add_field(name="Status", value="🔴 Stopped", inline=True)
             
             if vps:
@@ -2221,7 +2268,7 @@ class VPSManagementView(ui.View):
                 embed.add_field(name="Created", value=vps['created_at'], inline=True)
             
             await interaction.message.edit(embed=embed)
-            await interaction.followup.send("✅ UnixNodes VPS stopped successfully!", ephemeral=True)
+            await interaction.followup.send("✅ HostForge VPS stopped successfully!", ephemeral=True)
         except Exception as e:
             await interaction.followup.send(f"❌ Error stopping VPS: {str(e)}", ephemeral=True)
 
@@ -2270,15 +2317,16 @@ class VPSManagementView(ui.View):
                         # Send new SSH details to owner
                         try:
                             owner = await bot.fetch_user(int(vps["created_by"]))
-                            embed = discord.Embed(title=f"UnixNodes VPS Restarted - {self.vps_id}", color=discord.Color.blue())
+                            embed = discord.Embed(title=f"HostForge VPS Restarted - {self.vps_id}", color=discord.Color.blue())
                             embed.add_field(name="New SSH Session", value=f"```{ssh_session_line}```", inline=False)
+                            embed.add_field(name="Direct SSH", value=f"```ssh root@{bot.public_ip} -p {vps['external_ssh_port']}```", inline=False)
                             await owner.send(embed=embed)
                         except:
                             pass
                 except:
                     pass
             
-            embed = discord.Embed(title=f"UnixNodes VPS Management - {self.vps_id}", color=discord.Color.green())
+            embed = discord.Embed(title=f"HostForge VPS Management - {self.vps_id}", color=discord.Color.green())
             embed.add_field(name="Status", value="🟢 Running", inline=True)
             
             if vps:
@@ -2290,7 +2338,7 @@ class VPSManagementView(ui.View):
                 embed.add_field(name="Restart Count", value=vps.get('restart_count', 0) + 1, inline=True)
             
             await interaction.message.edit(embed=embed, view=VPSManagementView(self.vps_id, container.id))
-            await interaction.followup.send("✅ UnixNodes VPS restarted successfully! New SSH details sent to owner.", ephemeral=True)
+            await interaction.followup.send("✅ HostForge VPS restarted successfully! New SSH details sent to owner.", ephemeral=True)
         except Exception as e:
             await interaction.followup.send(f"❌ Error restarting VPS: {str(e)}", ephemeral=True)
 
@@ -2320,7 +2368,7 @@ class OSSelectionView(ui.View):
         self.container_id = container_id
         self.original_message = original_message
         
-        self.add_os_button("Ubuntu 22.04", "arindamvm/unvm")
+        self.add_os_button("Ubuntu 22.04", "ubuntu:22.04")
         self.add_os_button("Debian 12", "debian:12")
         self.add_os_button("Arch Linux", "archlinux:latest")
         self.add_os_button("Alpine", "alpine:latest")
@@ -2352,7 +2400,7 @@ class OSSelectionView(ui.View):
             except Exception as e:
                 logger.error(f"Error removing old container: {e}")
 
-            status_msg = await interaction.followup.send("🔄 Reinstalling UnixNodes VPS... This may take a few minutes.", ephemeral=True)
+            status_msg = await interaction.followup.send("🔄 Reinstalling HostForge VPS... This may take a few minutes.", ephemeral=True)
             
             memory_bytes = vps['memory'] * 1024 * 1024 * 1024
 
@@ -2361,7 +2409,7 @@ class OSSelectionView(ui.View):
                     image,
                     detach=True,
                     privileged=True,
-                    hostname=f"unixnodes-{self.vps_id}",
+                    hostname=f"hostforge-{self.vps_id}",
                     mem_limit=memory_bytes,
                     cpu_period=100000,
                     cpu_quota=int(vps['cpu'] * 100000),
@@ -2369,8 +2417,9 @@ class OSSelectionView(ui.View):
                     command="tail -f /dev/null",
                     tty=True,
                     network=DOCKER_NETWORK,
+                    ports={'22/tcp': str(vps['external_ssh_port'])},
                     volumes={
-                        f'unixnodes-{self.vps_id}': {'bind': '/data', 'mode': 'rw'}
+                        f'hostforge-{self.vps_id}': {'bind': '/data', 'mode': 'rw'}
                     }
                 )
             except docker.errors.ImageNotFound:
@@ -2379,7 +2428,7 @@ class OSSelectionView(ui.View):
                     DEFAULT_OS_IMAGE,
                     detach=True,
                     privileged=True,
-                    hostname=f"unixnodes-{self.vps_id}",
+                    hostname=f"hostforge-{self.vps_id}",
                     mem_limit=memory_bytes,
                     cpu_period=100000,
                     cpu_quota=int(vps['cpu'] * 100000),
@@ -2387,8 +2436,9 @@ class OSSelectionView(ui.View):
                     command="tail -f /dev/null",
                     tty=True,
                     network=DOCKER_NETWORK,
+                    ports={'22/tcp': str(vps['external_ssh_port'])},
                     volumes={
-                        f'unixnodes-{self.vps_id}': {'bind': '/data', 'mode': 'rw'}
+                        f'hostforge-{self.vps_id}': {'bind': '/data', 'mode': 'rw'}
                     }
                 )
                 image = DEFAULT_OS_IMAGE
@@ -2399,17 +2449,16 @@ class OSSelectionView(ui.View):
             })
 
             try:
-                setup_success, ssh_password, _ = await setup_container(
+                setup_success, _ = await setup_container(
                     container.id, 
                     status_msg, 
                     vps['memory'], 
-                    vps['username'], 
                     vps_id=self.vps_id
                 )
                 if not setup_success:
                     raise Exception("Failed to setup container")
                 
-                bot.db.update_vps(token, {'password': ssh_password})
+                bot.db.update_vps(token, {'password': "root"})
             except Exception as e:
                 await status_msg.edit(content=f"❌ Container setup failed: {str(e)}")
                 return
@@ -2428,25 +2477,26 @@ class OSSelectionView(ui.View):
                     # Send new SSH details to owner
                     try:
                         owner = await bot.fetch_user(int(vps["created_by"]))
-                        embed = discord.Embed(title=f"UnixNodes VPS Reinstalled - {self.vps_id}", color=discord.Color.blue())
+                        embed = discord.Embed(title=f"HostForge VPS Reinstalled - {self.vps_id}", color=discord.Color.blue())
                         embed.add_field(name="New OS", value=image, inline=True)
                         embed.add_field(name="New SSH Session", value=f"```{ssh_session_line}```", inline=False)
-                        embed.add_field(name="New SSH Password", value=f"||{ssh_password}||", inline=False)
+                        embed.add_field(name="Direct SSH", value=f"```ssh root@{bot.public_ip} -p {vps['external_ssh_port']}```", inline=False)
+                        embed.add_field(name="Password", value=f"||root||", inline=False)
                         await owner.send(embed=embed)
                     except:
                         pass
             except Exception as e:
                 logger.error(f"Warning: Failed to start tmate session: {e}")
 
-            await status_msg.edit(content="✅ UnixNodes VPS reinstalled successfully!")
+            await status_msg.edit(content="✅ HostForge VPS reinstalled successfully!")
             
             try:
-                embed = discord.Embed(title=f"UnixNodes VPS Management - {self.vps_id}", color=discord.Color.green())
+                embed = discord.Embed(title=f"HostForge VPS Management - {self.vps_id}", color=discord.Color.green())
                 embed.add_field(name="Status", value="🟢 Running", inline=True)
                 embed.add_field(name="Memory", value=f"{vps['memory']}GB", inline=True)
                 embed.add_field(name="CPU", value=f"{vps['cpu']} cores", inline=True)
                 embed.add_field(name="Disk", value=f"{vps['disk']}GB", inline=True)
-                embed.add_field(name="Username", value=vps['username'], inline=True)
+                embed.add_field(name="Username", value="root", inline=True)
                 embed.add_field(name="Created", value=vps['created_at'], inline=True)
                 embed.add_field(name="OS", value=image, inline=True)
                 
@@ -2460,7 +2510,7 @@ class OSSelectionView(ui.View):
             except:
                 try:
                     channel = interaction.channel
-                    await channel.send(f"❌ Error reinstalling UnixNodes VPS {self.vps_id}: {str(e)}")
+                    await channel.send(f"❌ Error reinstalling HostForge VPS {self.vps_id}: {str(e)}")
                 except:
                     logger.error(f"Failed to send error message: {e}")
 
@@ -2529,18 +2579,19 @@ class TransferVPSModal(ui.Modal, title='Transfer VPS'):
 
             bot.db.update_vps(token, {"created_by": str(new_owner.id)})
 
-            await interaction.response.send_message(f"✅ UnixNodes VPS {self.vps_id} has been transferred from {old_owner_name} to {new_owner_name}!", ephemeral=True)
+            await interaction.response.send_message(f"✅ HostForge VPS {self.vps_id} has been transferred from {old_owner_name} to {new_owner_name}!", ephemeral=True)
             
             try:
-                embed = discord.Embed(title="UnixNodes VPS Transferred to You", color=discord.Color.green())
+                embed = discord.Embed(title="HostForge VPS Transferred to You", color=discord.Color.green())
                 embed.add_field(name="VPS ID", value=self.vps_id, inline=True)
                 embed.add_field(name="Previous Owner", value=old_owner_name, inline=True)
                 embed.add_field(name="Memory", value=f"{vps['memory']}GB", inline=True)
                 embed.add_field(name="CPU", value=f"{vps['cpu']} cores", inline=True)
                 embed.add_field(name="Disk", value=f"{vps['disk']}GB", inline=True)
-                embed.add_field(name="Username", value=vps['username'], inline=True)
+                embed.add_field(name="Username", value="root", inline=True)
                 embed.add_field(name="Access Token", value=token, inline=False)
-                embed.add_field(name="SSH Password", value=f"||{vps.get('password', 'Not set')}||", inline=False)
+                embed.add_field(name="SSH Password", value=f"||root||", inline=False)
+                embed.add_field(name="Direct SSH", value=f"```ssh root@{bot.public_ip} -p {vps['external_ssh_port']}```", inline=False)
                 await new_owner.send(embed=embed)
             except:
                 await interaction.followup.send("Note: Could not send DM to the new owner.", ephemeral=True)
@@ -2569,15 +2620,16 @@ async def manage_vps(ctx, vps_id: str):
 
         status = vps['status'].capitalize()
 
-        embed = discord.Embed(title=f"UnixNodes VPS Management - {vps_id}", color=discord.Color.blue())
+        embed = discord.Embed(title=f"HostForge VPS Management - {vps_id}", color=discord.Color.blue())
         embed.add_field(name="Status", value=f"{status} (Container: {container_status})", inline=True)
         embed.add_field(name="Memory", value=f"{vps['memory']}GB", inline=True)
         embed.add_field(name="CPU", value=f"{vps['cpu']} cores", inline=True)
         embed.add_field(name="Disk Allocated", value=f"{vps['disk']}GB", inline=True)
-        embed.add_field(name="Username", value=vps['username'], inline=True)
+        embed.add_field(name="Username", value="root", inline=True)
         embed.add_field(name="Created", value=vps['created_at'], inline=True)
         embed.add_field(name="OS", value=vps.get('os_image', DEFAULT_OS_IMAGE), inline=True)
         embed.add_field(name="Restart Count", value=vps.get('restart_count', 0), inline=True)
+        embed.add_field(name="SSH Port", value=vps['external_ssh_port'], inline=True)
 
         view = VPSManagementView(vps_id, vps["container_id"])
         
@@ -2611,18 +2663,19 @@ async def transfer_vps_command(ctx, vps_id: str, new_owner: discord.Member):
 
         bot.db.update_vps(token, {"created_by": str(new_owner.id)})
 
-        await ctx.send(f"✅ UnixNodes VPS {vps_id} has been transferred from {ctx.author.name} to {new_owner.name}!")
+        await ctx.send(f"✅ HostForge VPS {vps_id} has been transferred from {ctx.author.name} to {new_owner.name}!")
 
         try:
-            embed = discord.Embed(title="UnixNodes VPS Transferred to You", color=discord.Color.green())
+            embed = discord.Embed(title="HostForge VPS Transferred to You", color=discord.Color.green())
             embed.add_field(name="VPS ID", value=vps_id, inline=True)
             embed.add_field(name="Previous Owner", value=ctx.author.name, inline=True)
             embed.add_field(name="Memory", value=f"{vps['memory']}GB", inline=True)
             embed.add_field(name="CPU", value=f"{vps['cpu']} cores", inline=True)
             embed.add_field(name="Disk", value=f"{vps['disk']}GB", inline=True)
-            embed.add_field(name="Username", value=vps['username'], inline=True)
+            embed.add_field(name="Username", value="root", inline=True)
             embed.add_field(name="Access Token", value=token, inline=False)
-            embed.add_field(name="SSH Password", value=f"||{vps.get('password', 'Not set')}||", inline=False)
+            embed.add_field(name="SSH Password", value=f"||root||", inline=False)
+            embed.add_field(name="Direct SSH", value=f"```ssh root@{bot.public_ip} -p {vps['external_ssh_port']}```", inline=False)
             await new_owner.send(embed=embed)
         except:
             await ctx.send("Note: Could not send DM to the new owner.", ephemeral=True)
@@ -2653,5 +2706,4 @@ if __name__ == "__main__":
         bot.run(TOKEN)
     except Exception as e:
         logger.error(f"Bot crashed: {e}")
-
         traceback.print_exc()
